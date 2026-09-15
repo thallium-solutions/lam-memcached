@@ -1,0 +1,19 @@
+[library]
+name = "@lam/memcached"
+version = "1.0.0"
+description = "Binary-protocol Memcached client with optional SASL authentication for Lammergeier"
+license = "Apache-2.0"
+authors = ["Lammergeier contributors"]
+repository = "https://github.com/thallium-solutions/lam-memcached"
+homepage = "https://github.com/thallium-solutions/lam-memcached"
+
+[compatibility]
+lamc = "^1.16"
+
+[go-deps]
+"github.com/memcachier/mc/v3" = "v3.0.3"
+
+[scripts]
+test = "python3 tests/run_memcached_tests.py --verbose"
+format = "lamc fmt ."
+service = "sh test-services.sh"
