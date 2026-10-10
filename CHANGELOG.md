@@ -2,6 +2,30 @@
 
 All notable changes to `@lam/memcached` are documented here.
 
+## 2.0.0
+
+### Changed
+
+- Replaced expected service/transport panics with unsuffixed, typed `Result[T]`
+  APIs across connection, storage, counters, maintenance, metadata, and close.
+- Changed `Memcached.connect` to return `Result[Memcached]` while preserving its
+  eager `NOOP` handshake and cleaning up the pool when that handshake fails.
+- Changed missing `get` from the ambiguous empty-string sentinel to a
+  `MemcachedNotFound` error; explicit conditional-mutation outcomes remain
+  `Ok(false)` values.
+- Fixed append/prepend misses by treating `mc/v3`'s `ErrValueNotStored` as
+  `Ok(false)` instead of a transport error.
+- Replaced the class constructor spelling `__init__` with `init`, added argument
+  validation, and limited raw Go to the `mc/v3` boundary.
+- Bumped the package major version to 2.0.0 and compiler compatibility to
+  `lamc ^1.18`.
+- Updated consumer tests and examples to handle or propagate `Result` values.
+
+### Testing
+
+- Added a service-backed installed-package matrix across plain/authenticated
+  clients, storage and counters, typed misses, validation, cleanup, and close.
+
 ## 1.0.0 - 2026-09-13
 
 ### Added

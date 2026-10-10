@@ -1,0 +1,172 @@
+# Complex service-backed coverage for v2 Memcached Results and both fixtures.
+# expect: PASS 1 empty address is a typed argument error
+# expect: PASS 2 unauthenticated connect performs a NOOP
+# expect: PASS 3 independent authenticated connects succeed
+# expect: PASS 4 authenticated connect performs a NOOP
+# expect: PASS 5 empty string remains a present value
+# expect: PASS 6 missing GET is typed MemcachedNotFound
+# expect: PASS 7 set get and exists compose
+# expect: PASS 8 add distinguishes creation from collision
+# expect: PASS 9 replace distinguishes existing from missing
+# expect: PASS 10 delete distinguishes existing from missing
+# expect: PASS 11 touch distinguishes existing from missing
+# expect: PASS 12 increment creates a counter with its initial value
+# expect: PASS 13 counter increments and decrements compose
+# expect: PASS 14 append and prepend preserve byte ordering
+# expect: PASS 15 append and prepend report missing keys
+# expect: PASS 16 version reports at least one server
+# expect: PASS 17 stats include curr_items
+# expect: PASS 18 negative set TTL is a typed argument error
+# expect: PASS 19 negative touch TTL is a typed argument error
+# expect: PASS 20 negative counter input is a typed argument error
+# expect: PASS 21 negative flush delay is a typed argument error
+# expect: PASS 22 authenticated storage round trip succeeds
+# expect: PASS 23 plain-fixture cleanup removes all test keys
+# expect: PASS 24 auth-fixture cleanup removes all test keys
+# expect: PASS 25 operations on a closed client return errors
+# expect: 25 passed, 0 failed, 25 total
+
+from @lam/memcached import Memcached
+from lamerrors import Error, Result
+from lamtest import Test
+
+func cleanup(client: Memcached, keys: list[str]) -> Result[bool] {
+    for key in keys {
+        _ = client.delete(key)?
+    }
+    return Result.Ok(true)
+}
+
+func run() -> Result[bool] {
+    prefix: str = "lam:v2:complex:memcached:"
+    emptyKey: str = prefix + "empty"
+    valueKey: str = prefix + "value"
+    addKey: str = prefix + "add"
+    replaceKey: str = prefix + "replace"
+    touchKey: str = prefix + "touch"
+    counterKey: str = prefix + "counter"
+    bufferKey: str = prefix + "buffer"
+    missingKey: str = prefix + "missing"
+    authKey: str = prefix + "auth"
+    plainKeys: list[str] = [emptyKey, valueKey, addKey, replaceKey, touchKey, counterKey, bufferKey, missingKey]
+
+    invalidAddress: Result[Memcached] = Memcached.connect("")
+    invalidAddressError: Error = invalidAddress.error
+    Test.assertTrue(not invalidAddress.ok() and invalidAddressError.kind == "MemcachedArgumentError", "1 empty address is a typed argument error")
+
+    plain: Memcached = Memcached.connect("localhost:11211")?
+    _ = cleanup(plain, plainKeys)?
+    plainNoop: bool = plain.noop()?
+    Test.assertTrue(plainNoop, "2 unauthenticated connect performs a NOOP")
+
+    secondAuth: Result[Memcached] = Memcached.connect("localhost:11212", username = "memuser", password = "mempass123")
+    Test.assertTrue(secondAuth.ok(), "3 independent authenticated connects succeed")
+    secondAuthClient: Memcached = secondAuth?
+    _ = secondAuthClient.close()?
+
+    auth: Memcached = Memcached.connect("localhost:11212", username = "memuser", password = "mempass123")?
+    _ = cleanup(auth, [authKey])?
+    authNoop: bool = auth.noop()?
+    Test.assertTrue(authNoop, "4 authenticated connect performs a NOOP")
+
+    _ = plain.set(emptyKey, "")?
+    empty: Result[str] = plain.get(emptyKey)
+    emptyExists: bool = plain.exists(emptyKey)?
+    Test.assertTrue(empty.ok() and empty.value == "" and emptyExists, "5 empty string remains a present value")
+    missing: Result[str] = plain.get(missingKey)
+    missingError: Error = missing.error
+    Test.assertTrue(not missing.ok() and missingError.kind == "MemcachedNotFound", "6 missing GET is typed MemcachedNotFound")
+
+    setOk: bool = plain.set(valueKey, "hello")?
+    storedValue: str = plain.get(valueKey)?
+    valueExists: bool = plain.exists(valueKey)?
+    Test.assertTrue(setOk and storedValue == "hello" and valueExists, "7 set get and exists compose")
+
+    firstAdd: bool = plain.add(addKey, "first")?
+    secondAdd: bool = plain.add(addKey, "second")?
+    addedValue: str = plain.get(addKey)?
+    Test.assertTrue(firstAdd and not secondAdd and addedValue == "first", "8 add distinguishes creation from collision")
+
+    _ = plain.set(replaceKey, "before")?
+    existingReplace: bool = plain.replace(replaceKey, "after")?
+    missingReplace: bool = plain.replace(missingKey, "never")?
+    replacedValue: str = plain.get(replaceKey)?
+    Test.assertTrue(existingReplace and not missingReplace and replacedValue == "after", "9 replace distinguishes existing from missing")
+    firstDelete: bool = plain.delete(replaceKey)?
+    secondDelete: bool = plain.delete(replaceKey)?
+    deletedExists: bool = plain.exists(replaceKey)?
+    Test.assertTrue(firstDelete and not secondDelete and not deletedExists, "10 delete distinguishes existing from missing")
+
+    _ = plain.set(touchKey, "alive")?
+    touched: bool = plain.touch(touchKey, 60)?
+    missingTouch: bool = plain.touch(missingKey, 60)?
+    touchedValue: str = plain.get(touchKey)?
+    Test.assertTrue(touched and not missingTouch and touchedValue == "alive", "11 touch distinguishes existing from missing")
+
+    initialCount: int = plain.incr(counterKey, 1, 0)?
+    Test.assertTrue(initialCount == 0, "12 increment creates a counter with its initial value")
+    raisedCount: int = plain.incr(counterKey, 5)?
+    loweredCount: int = plain.decr(counterKey, 2)?
+    Test.assertTrue(raisedCount == 5 and loweredCount == 3, "13 counter increments and decrements compose")
+
+    _ = plain.set(bufferKey, "core")?
+    appended: bool = plain.append(bufferKey, ">")?
+    prepended: bool = plain.prepend(bufferKey, "<")?
+    combinedValue: str = plain.get(bufferKey)?
+    Test.assertTrue(appended and prepended and combinedValue == "<core>", "14 append and prepend preserve byte ordering")
+    missingAppend: bool = plain.append(missingKey, "x")?
+    missingPrepend: bool = plain.prepend(missingKey, "x")?
+    Test.assertTrue(not missingAppend and not missingPrepend, "15 append and prepend report missing keys")
+
+    versions: dict[str, str] = plain.version()?
+    Test.assertTrue(len(versions) > 0, "16 version reports at least one server")
+    serverStats: dict[str, dict[str, str]] = plain.stats()?
+    hasCurrItems: bool = false
+    for _server, stats in serverStats {
+        for name, _value in stats {
+            if name == "curr_items" {
+                hasCurrItems = true
+            }
+        }
+    }
+    Test.assertTrue(len(serverStats) > 0 and hasCurrItems, "17 stats include curr_items")
+
+    badSet: Result[bool] = plain.set(prefix + "bad-set", "x", -1)
+    badSetError: Error = badSet.error
+    Test.assertTrue(not badSet.ok() and badSetError.kind == "MemcachedArgumentError", "18 negative set TTL is a typed argument error")
+    badTouch: Result[bool] = plain.touch(touchKey, -1)
+    badTouchError: Error = badTouch.error
+    Test.assertTrue(not badTouch.ok() and badTouchError.kind == "MemcachedArgumentError", "19 negative touch TTL is a typed argument error")
+    badCounter: Result[int] = plain.incr(counterKey, -1)
+    badCounterError: Error = badCounter.error
+    Test.assertTrue(not badCounter.ok() and badCounterError.kind == "MemcachedArgumentError", "20 negative counter input is a typed argument error")
+    badFlush: Result[bool] = plain.flush(-1)
+    badFlushError: Error = badFlush.error
+    Test.assertTrue(not badFlush.ok() and badFlushError.kind == "MemcachedArgumentError", "21 negative flush delay is a typed argument error")
+
+    _ = auth.set(authKey, "secret")?
+    authValue: str = auth.get(authKey)?
+    authExists: bool = auth.exists(authKey)?
+    Test.assertTrue(authValue == "secret" and authExists, "22 authenticated storage round trip succeeds")
+
+    _ = cleanup(plain, plainKeys)?
+    plainMissing: Result[str] = plain.get(valueKey)
+    plainMissingError: Error = plainMissing.error
+    Test.assertTrue(not plainMissing.ok() and plainMissingError.kind == "MemcachedNotFound", "23 plain-fixture cleanup removes all test keys")
+    _ = cleanup(auth, [authKey])?
+    authMissing: Result[str] = auth.get(authKey)
+    authMissingError: Error = authMissing.error
+    Test.assertTrue(not authMissing.ok() and authMissingError.kind == "MemcachedNotFound", "24 auth-fixture cleanup removes all test keys")
+
+    _ = plain.close()?
+    closedGet: Result[str] = plain.get(valueKey)
+    closedError: Error = closedGet.error
+    Test.assertTrue(not closedGet.ok() and closedError.kind == "MemcachedError", "25 operations on a closed client return errors")
+    _ = auth.close()?
+    return Result.Ok(true)
+}
+
+func main() {
+    _ = run().unwrap()
+    Test.summary()
+}

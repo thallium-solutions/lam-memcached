@@ -1,42 +1,11 @@
 # Copyright 2026 Thallium Solutions di Busconi Alessandro.
 # SPDX-License-Identifier: Apache-2.0
 #
-# @lam/memcached — binary-protocol Memcached client.
-#
-# Thin wrapper around ``github.com/memcachier/mc/v3``. We picked the
-# ``memcachier/mc`` library over the much-more-popular
-# ``bradfitz/gomemcache`` for one reason: it speaks the *binary*
-# protocol, which is the only memcached dialect that supports SASL
-# PLAIN authentication. That lets the same client talk to both
-# unauthenticated dev containers (``mc.connect("localhost:11211")``)
-# and a hardened cluster behind credentials
-# (``mc.connect("localhost:11211", username="u", password="p")``)
-# with no API surface change.
-#
-#     from @lam/memcached import Memcached
-#
-#     # No-auth.
-#     m: Memcached = Memcached.connect("localhost:11211")
-#     m.set("greeting", "hello")
-#     msg: str = m.get("greeting")            # "hello"
-#
-#     # SASL auth.
-#     m2: Memcached = Memcached.connect(
-#         "localhost:11211",
-#         username="memuser",
-#         password="mempass123",
-#     )
-#
-#     # TTL & atomic counters.
-#     m.set("session:42", "alice", ttlSec=600)
-#     n: int = m.incr("hits", by=1, initial=0)
-#
-# Missing-key semantics: ``get`` returns ``""`` for absent keys; use
-# ``exists()`` if you need to distinguish "missing" from "empty
-# string". Mutating helpers that race against missing keys (``add``,
-# ``replace``, ``delete``, ``touch``) return a ``bool`` so the caller
-# doesn't have to inspect an error.
+# @lam/memcached — Result-first binary-protocol Memcached client.
 
+from lamerrors import Error, Result
+
+# Direct Go is intentionally limited to the mc/v3 client boundary.
 go! {
     import (
         "errors"
@@ -45,12 +14,6 @@ go! {
         mcgo "github.com/memcachier/mc/v3"
     )
 
-    // ─── Error helpers ───────────────────────────────────────
-    // ``mc/v3`` returns the *same* sentinel pointer for every
-    // miss / collision / auth-required reply, so ``errors.Is``
-    // keeps working across versions even if the library starts
-    // wrapping its errors in the future.
-
     func lamMcIsNotFound(err error) bool {
         return err != nil && errors.Is(err, mcgo.ErrNotFound)
     }
@@ -58,257 +21,333 @@ go! {
     func lamMcIsKeyExists(err error) bool {
         return err != nil && errors.Is(err, mcgo.ErrKeyExists)
     }
+
+    func lamMcIsNotStored(err error) bool {
+        return err != nil && errors.Is(err, mcgo.ErrValueNotStored)
+    }
+
+    func lamMcFailure(operation string, err error) *LAMMERGEIER.Result {
+        return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+            "MemcachedError", fmt.Sprintf("memcached: %s: %v", operation, err), nil,
+        ))
+    }
+
+    func lamMcMissing(operation string, key string) *LAMMERGEIER.Result {
+        return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
+            "MemcachedNotFound", fmt.Sprintf("memcached: %s %s: key not found", operation, key), nil,
+        ))
+    }
 }
 
 class Memcached {
-    #- Binary-protocol client backed by a goroutine-safe ``mc/v3`` connection pool. -#
+    #- Binary-protocol client backed by a goroutine-safe mc/v3 connection pool.
+       Every operation that can fail at the service or transport boundary returns
+       Result. A missing value is MemcachedNotFound rather than an empty string. -#
 
-    func __init__(self) {
+    func init(self) {
         self._client: any = None
     }
 
-    static func connect(addr: str, username: str = "", password: str = "") -> Memcached {
-        #- Connect to ``host:port``, optionally authenticate, and eagerly perform a ``noop``. -#
-        m: Memcached = Memcached()
-        go! {
-            m._client = mcgo.NewMC(addr, username, password)
+    static func connect(addr: str, username: str = "", password: str = "") -> Result[Memcached] {
+        #- Construct a client and eagerly complete a NOOP round trip. -#
+        if addr.trim() == "" {
+            return Result.Err(Error("MemcachedArgumentError", "memcached: address must not be empty", None))
         }
-        m.noop()
-        return m
+        go! {
+            client := mcgo.NewMC(addr, username, password)
+            if err := client.NoOp(); err != nil {
+                client.Quit()
+                return lamMcFailure("connect", err)
+            }
+            value := NewMemcached()
+            value._client = client
+            return LAMMERGEIER.Result.Ok(value)
+        }
     }
 
-    func close(self) {
-        #- Release every pooled connection; calling ``close`` twice is a no-op. -#
+    func close(self) -> Result[any] {
+        #- Release every pooled connection. Calling close twice succeeds. -#
         go! {
-            if c, ok := s._client.(*mcgo.Client); ok && c != nil {
-                c.Quit()
+            if client, ok := s._client.(*mcgo.Client); ok && client != nil {
+                client.Quit()
             }
             s._client = nil
+            return LAMMERGEIER.Result.Ok(nil)
         }
     }
 
-    # ── Basic KV ─────────────────────────────────────────────
-    func get(self, key: str) -> str {
-        #- ``GET`` returns the stored value, or ``""`` when the key is absent. -#
-        out: str = ""
+    func get(self, key: str) -> Result[str] {
+        #- Return the stored value; a missing key is MemcachedNotFound. -#
         go! {
-            c := s._client.(*mcgo.Client)
-            v, _, _, err := c.Get(key)
+            client, ok := s._client.(*mcgo.Client)
+            if !ok || client == nil {
+                return lamMcFailure("GET "+key, errors.New("client is closed"))
+            }
+            value, _, _, err := client.Get(key)
+            if lamMcIsNotFound(err) {
+                return lamMcMissing("GET", key)
+            }
             if err != nil {
-                if !lamMcIsNotFound(err) {
-                    panic(fmt.Sprintf("memcached: GET %s: %v", key, err))
-                }
-            } else {
-                out = v
+                return lamMcFailure("GET "+key, err)
             }
+            return LAMMERGEIER.Result.Ok(value)
         }
-        return out
     }
 
-    func set(self, key: str, value: str, ttlSec: int = 0) {
-        #- ``SET`` stores ``value``; ``ttlSec == 0`` means no expiry. -#
+    func set(self, key: str, value: str, ttlSec: int = 0) -> Result[bool] {
+        if ttlSec < 0 {
+            return Result.Err(Error("MemcachedArgumentError", "memcached: ttlSec cannot be negative", None))
+        }
         go! {
-            c := s._client.(*mcgo.Client)
-            _, err := c.Set(key, value, 0, uint32(ttlSec), 0)
+            client, ok := s._client.(*mcgo.Client)
+            if !ok || client == nil {
+                return lamMcFailure("SET "+key, errors.New("client is closed"))
+            }
+            if _, err := client.Set(key, value, 0, uint32(ttlSec), 0); err != nil {
+                return lamMcFailure("SET "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(true)
+        }
+    }
+
+    func add(self, key: str, value: str, ttlSec: int = 0) -> Result[bool] {
+        #- Ok(false) means the key already exists. -#
+        if ttlSec < 0 {
+            return Result.Err(Error("MemcachedArgumentError", "memcached: ttlSec cannot be negative", None))
+        }
+        go! {
+            client, ok := s._client.(*mcgo.Client)
+            if !ok || client == nil {
+                return lamMcFailure("ADD "+key, errors.New("client is closed"))
+            }
+            _, err := client.Add(key, value, 0, uint32(ttlSec))
+            if lamMcIsKeyExists(err) {
+                return LAMMERGEIER.Result.Ok(false)
+            }
             if err != nil {
-                panic(fmt.Sprintf("memcached: SET %s: %v", key, err))
+                return lamMcFailure("ADD "+key, err)
             }
+            return LAMMERGEIER.Result.Ok(true)
         }
     }
 
-    func add(self, key: str, value: str, ttlSec: int = 0) -> bool {
-        #- ``ADD`` stores only if absent and reports whether it succeeded. -#
-        ok: bool = false
-        go! {
-            c := s._client.(*mcgo.Client)
-            _, err := c.Add(key, value, 0, uint32(ttlSec))
-            if err == nil {
-                ok = true
-            } else if !lamMcIsKeyExists(err) {
-                panic(fmt.Sprintf("memcached: ADD %s: %v", key, err))
-            }
+    func replace(self, key: str, value: str, ttlSec: int = 0) -> Result[bool] {
+        #- Ok(false) means the key does not exist. -#
+        if ttlSec < 0 {
+            return Result.Err(Error("MemcachedArgumentError", "memcached: ttlSec cannot be negative", None))
         }
-        return ok
-    }
-
-    func replace(self, key: str, value: str, ttlSec: int = 0) -> bool {
-        #- ``REPLACE`` overwrites an existing key and returns ``false`` if absent. -#
-        ok: bool = false
         go! {
-            c := s._client.(*mcgo.Client)
-            _, err := c.Replace(key, value, 0, uint32(ttlSec), 0)
-            if err == nil {
-                ok = true
-            } else if !lamMcIsNotFound(err) {
-                panic(fmt.Sprintf("memcached: REPLACE %s: %v", key, err))
+            client, ok := s._client.(*mcgo.Client)
+            if !ok || client == nil {
+                return lamMcFailure("REPLACE "+key, errors.New("client is closed"))
             }
-        }
-        return ok
-    }
-
-    func delete(self, key: str) -> bool {
-        #- ``DELETE`` reports whether a key was actually removed. -#
-        ok: bool = false
-        go! {
-            c := s._client.(*mcgo.Client)
-            err := c.Del(key)
-            if err == nil {
-                ok = true
-            } else if !lamMcIsNotFound(err) {
-                panic(fmt.Sprintf("memcached: DEL %s: %v", key, err))
+            _, err := client.Replace(key, value, 0, uint32(ttlSec), 0)
+            if lamMcIsNotFound(err) {
+                return LAMMERGEIER.Result.Ok(false)
             }
-        }
-        return ok
-    }
-
-    func exists(self, key: str) -> bool {
-        #- Use ``GET`` to distinguish a missing key from an empty string. -#
-        out: bool = false
-        go! {
-            c := s._client.(*mcgo.Client)
-            _, _, _, err := c.Get(key)
-            if err == nil {
-                out = true
-            } else if !lamMcIsNotFound(err) {
-                panic(fmt.Sprintf("memcached: EXISTS %s: %v", key, err))
-            }
-        }
-        return out
-    }
-
-    func touch(self, key: str, ttlSec: int) -> bool {
-        #- Reset an existing key's TTL and return ``false`` when it is absent. -#
-        ok: bool = false
-        go! {
-            c := s._client.(*mcgo.Client)
-            _, err := c.Touch(key, uint32(ttlSec))
-            if err == nil {
-                ok = true
-            } else if !lamMcIsNotFound(err) {
-                panic(fmt.Sprintf("memcached: TOUCH %s: %v", key, err))
-            }
-        }
-        return ok
-    }
-
-    # ── Counters ─────────────────────────────────────────────
-    func incr(self, key: str, by: int = 1, initial: int = 0, ttlSec: int = 0) -> int {
-        #- Atomically increment, creating a missing key with ``initial``. -#
-        out: int = 0
-        go! {
-            c := s._client.(*mcgo.Client)
-            n, _, err := c.Incr(key, uint64(by), uint64(initial), uint32(ttlSec), 0)
             if err != nil {
-                panic(fmt.Sprintf("memcached: INCR %s: %v", key, err))
+                return lamMcFailure("REPLACE "+key, err)
             }
-            out = int(n)
+            return LAMMERGEIER.Result.Ok(true)
         }
-        return out
     }
 
-    func decr(self, key: str, by: int = 1, initial: int = 0, ttlSec: int = 0) -> int {
-        #- Atomically decrement with zero saturation, creating with ``initial`` if absent. -#
-        out: int = 0
+    func delete(self, key: str) -> Result[bool] {
+        #- Ok(false) means the key did not exist. -#
         go! {
-            c := s._client.(*mcgo.Client)
-            n, _, err := c.Decr(key, uint64(by), uint64(initial), uint32(ttlSec), 0)
+            client, ok := s._client.(*mcgo.Client)
+            if !ok || client == nil {
+                return lamMcFailure("DELETE "+key, errors.New("client is closed"))
+            }
+            err := client.Del(key)
+            if lamMcIsNotFound(err) {
+                return LAMMERGEIER.Result.Ok(false)
+            }
             if err != nil {
-                panic(fmt.Sprintf("memcached: DECR %s: %v", key, err))
+                return lamMcFailure("DELETE "+key, err)
             }
-            out = int(n)
-        }
-        return out
-    }
-
-    # ── Append / prepend ─────────────────────────────────────
-    func append(self, key: str, value: str) -> bool {
-        #- ``APPEND`` concatenates after an existing value and reports success. -#
-        ok: bool = false
-        go! {
-            c := s._client.(*mcgo.Client)
-            _, err := c.Append(key, value, 0)
-            if err == nil {
-                ok = true
-            } else if !lamMcIsNotFound(err) {
-                panic(fmt.Sprintf("memcached: APPEND %s: %v", key, err))
-            }
-        }
-        return ok
-    }
-
-    func prepend(self, key: str, value: str) -> bool {
-        #- ``PREPEND`` concatenates before an existing value and reports success. -#
-        ok: bool = false
-        go! {
-            c := s._client.(*mcgo.Client)
-            _, err := c.Prepend(key, value, 0)
-            if err == nil {
-                ok = true
-            } else if !lamMcIsNotFound(err) {
-                panic(fmt.Sprintf("memcached: PREPEND %s: %v", key, err))
-            }
-        }
-        return ok
-    }
-
-    # ── Maintenance ──────────────────────────────────────────
-    func flush(self, when: int = 0) {
-        #- ``FLUSH_ALL`` wipes every key now or after ``when`` seconds. -#
-        go! {
-            c := s._client.(*mcgo.Client)
-            if err := c.Flush(uint32(when)); err != nil {
-                panic(fmt.Sprintf("memcached: FLUSH: %v", err))
-            }
+            return LAMMERGEIER.Result.Ok(true)
         }
     }
 
-    func noop(self) {
-        #- ``NOOP`` performs the handshake and an explicit liveness round trip. -#
+    func exists(self, key: str) -> Result[bool] {
         go! {
-            c := s._client.(*mcgo.Client)
-            if err := c.NoOp(); err != nil {
-                panic(fmt.Sprintf("memcached: NOOP: %v", err))
+            client, ok := s._client.(*mcgo.Client)
+            if !ok || client == nil {
+                return lamMcFailure("EXISTS "+key, errors.New("client is closed"))
             }
-        }
-    }
-
-    func version(self) -> dict[str, str] {
-        #- ``VERSION`` returns a server-address-to-version dictionary. -#
-        out: dict[str, str] = {}
-        go! {
-            c := s._client.(*mcgo.Client)
-            v, err := c.Version()
+            _, _, _, err := client.Get(key)
+            if lamMcIsNotFound(err) {
+                return LAMMERGEIER.Result.Ok(false)
+            }
             if err != nil {
-                panic(fmt.Sprintf("memcached: VERSION: %v", err))
+                return lamMcFailure("EXISTS "+key, err)
             }
-            for k, val := range v {
-                out[k] = val
-            }
+            return LAMMERGEIER.Result.Ok(true)
         }
-        return out
     }
 
-    func stats(self) -> dict[str, dict[str, str]] {
-        #- ``STATS`` returns the full stats dump keyed by server address. -#
-        out: dict[str, dict[str, str]] = {}
+    func touch(self, key: str, ttlSec: int) -> Result[bool] {
+        #- Ok(false) means the key does not exist. -#
+        if ttlSec < 0 {
+            return Result.Err(Error("MemcachedArgumentError", "memcached: ttlSec cannot be negative", None))
+        }
         go! {
-            c := s._client.(*mcgo.Client)
-            stats, err := c.Stats()
-            if err != nil {
-                panic(fmt.Sprintf("memcached: STATS: %v", err))
+            client, ok := s._client.(*mcgo.Client)
+            if !ok || client == nil {
+                return lamMcFailure("TOUCH "+key, errors.New("client is closed"))
             }
-            for server, st := range stats {
-                inner := map[string]string{}
-                for k, v := range st {
-                    inner[k] = v
+            _, err := client.Touch(key, uint32(ttlSec))
+            if lamMcIsNotFound(err) {
+                return LAMMERGEIER.Result.Ok(false)
+            }
+            if err != nil {
+                return lamMcFailure("TOUCH "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(true)
+        }
+    }
+
+    func incr(self, key: str, by: int = 1, initial: int = 0, ttlSec: int = 0) -> Result[int] {
+        if by < 0 or initial < 0 or ttlSec < 0 {
+            return Result.Err(Error("MemcachedArgumentError", "memcached: counter values and ttlSec cannot be negative", None))
+        }
+        go! {
+            client, ok := s._client.(*mcgo.Client)
+            if !ok || client == nil {
+                return lamMcFailure("INCR "+key, errors.New("client is closed"))
+            }
+            value, _, err := client.Incr(key, uint64(by), uint64(initial), uint32(ttlSec), 0)
+            if err != nil {
+                return lamMcFailure("INCR "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(value))
+        }
+    }
+
+    func decr(self, key: str, by: int = 1, initial: int = 0, ttlSec: int = 0) -> Result[int] {
+        if by < 0 or initial < 0 or ttlSec < 0 {
+            return Result.Err(Error("MemcachedArgumentError", "memcached: counter values and ttlSec cannot be negative", None))
+        }
+        go! {
+            client, ok := s._client.(*mcgo.Client)
+            if !ok || client == nil {
+                return lamMcFailure("DECR "+key, errors.New("client is closed"))
+            }
+            value, _, err := client.Decr(key, uint64(by), uint64(initial), uint32(ttlSec), 0)
+            if err != nil {
+                return lamMcFailure("DECR "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(int(value))
+        }
+    }
+
+    func append(self, key: str, value: str) -> Result[bool] {
+        #- Ok(false) means the key does not exist. -#
+        go! {
+            client, ok := s._client.(*mcgo.Client)
+            if !ok || client == nil {
+                return lamMcFailure("APPEND "+key, errors.New("client is closed"))
+            }
+            _, err := client.Append(key, value, 0)
+            if lamMcIsNotFound(err) || lamMcIsNotStored(err) {
+                return LAMMERGEIER.Result.Ok(false)
+            }
+            if err != nil {
+                return lamMcFailure("APPEND "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(true)
+        }
+    }
+
+    func prepend(self, key: str, value: str) -> Result[bool] {
+        #- Ok(false) means the key does not exist. -#
+        go! {
+            client, ok := s._client.(*mcgo.Client)
+            if !ok || client == nil {
+                return lamMcFailure("PREPEND "+key, errors.New("client is closed"))
+            }
+            _, err := client.Prepend(key, value, 0)
+            if lamMcIsNotFound(err) || lamMcIsNotStored(err) {
+                return LAMMERGEIER.Result.Ok(false)
+            }
+            if err != nil {
+                return lamMcFailure("PREPEND "+key, err)
+            }
+            return LAMMERGEIER.Result.Ok(true)
+        }
+    }
+
+    func flush(self, when: int = 0) -> Result[bool] {
+        if when < 0 {
+            return Result.Err(Error("MemcachedArgumentError", "memcached: flush delay cannot be negative", None))
+        }
+        go! {
+            client, ok := s._client.(*mcgo.Client)
+            if !ok || client == nil {
+                return lamMcFailure("FLUSH", errors.New("client is closed"))
+            }
+            if err := client.Flush(uint32(when)); err != nil {
+                return lamMcFailure("FLUSH", err)
+            }
+            return LAMMERGEIER.Result.Ok(true)
+        }
+    }
+
+    func noop(self) -> Result[bool] {
+        go! {
+            client, ok := s._client.(*mcgo.Client)
+            if !ok || client == nil {
+                return lamMcFailure("NOOP", errors.New("client is closed"))
+            }
+            if err := client.NoOp(); err != nil {
+                return lamMcFailure("NOOP", err)
+            }
+            return LAMMERGEIER.Result.Ok(true)
+        }
+    }
+
+    func version(self) -> Result[dict[str, str]] {
+        go! {
+            client, ok := s._client.(*mcgo.Client)
+            if !ok || client == nil {
+                return lamMcFailure("VERSION", errors.New("client is closed"))
+            }
+            values, err := client.Version()
+            if err != nil {
+                return lamMcFailure("VERSION", err)
+            }
+            out := make(map[string]string, len(values))
+            for server, value := range values {
+                out[server] = value
+            }
+            return LAMMERGEIER.Result.Ok(out)
+        }
+    }
+
+    func stats(self) -> Result[dict[str, dict[str, str]]] {
+        go! {
+            client, ok := s._client.(*mcgo.Client)
+            if !ok || client == nil {
+                return lamMcFailure("STATS", errors.New("client is closed"))
+            }
+            values, err := client.Stats()
+            if err != nil {
+                return lamMcFailure("STATS", err)
+            }
+            out := make(map[string]map[string]string, len(values))
+            for server, stats := range values {
+                inner := make(map[string]string, len(stats))
+                for name, value := range stats {
+                    inner[name] = value
                 }
                 out[server] = inner
             }
+            return LAMMERGEIER.Result.Ok(out)
         }
-        return out
     }
 }
 
 func tag() -> str {
-    return "@lam/memcached@1.0.0"
+    return "@lam/memcached@2.0.0"
 }

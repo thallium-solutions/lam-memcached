@@ -20,7 +20,7 @@ from pathlib import Path
 
 LIB_ROOT = Path(__file__).resolve().parents[1]
 COMPILER = os.environ.get("LAMC", "lamc")
-MIN_COMPILER_VERSION = (1, 16, 0)
+MIN_COMPILER_VERSION = (1, 18, 0)
 VERSION_RE = re.compile(
     r"(?<![0-9])v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?(?![0-9])"
 )
@@ -157,7 +157,7 @@ def _prepare_consumer(root: Path) -> tuple[bool, str]:
         "version = \"0.0.0\"\n"
         "license = \"Apache-2.0\"\n\n"
         "[compatibility]\n"
-        "lamc = \"^1.16\"\n",
+        "lamc = \"^1.18\"\n",
         encoding="utf-8",
     )
     try:
