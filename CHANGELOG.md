@@ -2,7 +2,14 @@
 
 All notable changes to `@lam/memcached` are documented here.
 
-## 2.0.0
+## 2.0.0 - 2026-10-15
+
+### Removed
+
+- **Breaking:** removed the root `tag()` helper. The package name and version
+  are declared in `lamlib.toml`, and the generic top-level function made this
+  package impossible to link together with any other package (or application)
+  that also declared `tag()`, because all Lam modules share one Go package.
 
 ### Changed
 

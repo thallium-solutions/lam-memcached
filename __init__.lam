@@ -3,4 +3,4 @@
 #
 # Public API for @lam/memcached.
 
-from .memcached import Memcached, tag
+from .memcached import Memcached

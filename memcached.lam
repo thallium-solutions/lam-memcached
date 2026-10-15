@@ -347,7 +347,3 @@ class Memcached {
         }
     }
 }
-
-func tag() -> str {
-    return "@lam/memcached@2.0.0"
-}
