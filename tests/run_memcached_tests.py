@@ -157,7 +157,7 @@ def _prepare_consumer(root: Path) -> tuple[bool, str]:
         "version = \"0.0.0\"\n"
         "license = \"Apache-2.0\"\n\n"
         "[compatibility]\n"
-        "lamc = \"^1.18\"\n",
+        "lamc = \">=1.18, <3\"\n",
         encoding="utf-8",
     )
     try:
