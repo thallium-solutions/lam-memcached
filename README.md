@@ -11,7 +11,7 @@ empty strings. Fallible public methods use unsuffixed `Result[T]` APIs.
 
 ## Requirements and installation
 
-- `lamc` 1.18.0 or newer including 2.x (`>=1.18, <3`).
+- `lamc` 1.18.0 or newer including 2.x (`>=1.18, <4`).
 - A reachable Memcached server for runtime operations.
 - Go module downloads on the first build unless dependencies are cached.
 
