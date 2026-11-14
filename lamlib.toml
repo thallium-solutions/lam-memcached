@@ -1,6 +1,6 @@
 [library]
 name = "@lam/memcached"
-version = "2.0.3"
+version = "2.0.4"
 description = "Result-first binary-protocol Memcached client with optional SASL authentication"
 license = "Apache-2.0"
 authors = ["Lammergeier contributors"]

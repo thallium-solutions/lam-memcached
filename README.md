@@ -16,7 +16,7 @@ empty strings. Fallible public methods use unsuffixed `Result[T]` APIs.
 - Go module downloads on the first build unless dependencies are cached.
 
 ```bash
-lamc install @lam/memcached@2.0.0
+lamc install @lam/memcached@2.0.4
 # or
 lamc install https://github.com/thallium-solutions/lam-memcached.git
 ```
@@ -95,7 +95,7 @@ if value.ok() {
 | `delete(key)` | `Result[bool]` | `Ok(false)` when absent. |
 | `exists(key)` | `Result[bool]` | Distinguishes absence from empty values. |
 | `touch(key, ttlSec)` | `Result[bool]` | `Ok(false)` when absent. |
-| `incr(key, by=1, initial=0, ttlSec=0)` | `Result[int]` | Unsigned atomic increment. |
+| `incr(key, by=1, initial=0, ttlSec=0)` | `Result[int]` | Unsigned atomic increment; a counter above the `int` range is a `MemcachedError`. |
 | `decr(key, by=1, initial=0, ttlSec=0)` | `Result[int]` | Unsigned decrement with zero saturation. |
 | `append(key, value)` / `prepend(key, value)` | `Result[bool]` | `Ok(false)` when absent. |
 | `flush(when=0)` | `Result[bool]` | Flushes now or after a delay. |
@@ -123,7 +123,8 @@ python3 tests/run_memcached_tests.py --verbose --require-services
 ```
 
 Fixture endpoints are `localhost:11211` (no credentials) and
-`localhost:11212` (`memuser` / `mempass123`). `test-services.sh` can create
+`localhost:11212` (SASL PLAIN, `memuser` / `mempass123`; clients without
+these credentials are refused). `test-services.sh` can create
 those fixtures manually, but test automation should not start external or
 destructive services implicitly. The integration tests call `flush`, so never
 point them at shared or production Memcached instances.

@@ -1,0 +1,146 @@
+# Cross-feature: a cache-aside repository on the unauthenticated fixture.
+# A `ProductCache` class loads missing products from a slow "database"
+# (a dict), stores them with `add` so concurrent loaders do not overwrite
+# each other, counts hits and loads with memcached counters incremented
+# from 60 async tasks, invalidates with `delete`, and reports errors with
+# `?` and `do/catch`. Values are JSON with non-ASCII text.
+#
+# expect: concurrent first reads: 60 results, 3 distinct products
+# expect: every task saw its product: true
+# expect: loads stored once per product: 3
+# expect: hit counter: 60
+# expect: second pass hits the cache: 60 from cache
+# expect: invalidation reloads: Zoë's 🦅 lamp v2
+# expect: missing product: NotFound p-404
+# expect: append log: invalidate:p-2 load:p-1 load:p-2 load:p-2 load:p-3 start
+# expect: cleanup: true
+# expect: ok
+
+from @lam/memcached import Memcached
+from lamerrors import Result, Error
+from lamjson import Json
+
+const Prefix: str = "lam:composed:memcached:"
+
+class ProductCache {
+    func init(self, client: Memcached, database: dict[str, str]) {
+        self.client: Memcached = client
+        self.database: dict[str, str] = database
+    }
+
+    func key(self, id: str) -> str {
+        return Prefix + "product:" + id
+    }
+
+    func load(self, id: str) -> Result[str] {
+        if id not in self.database {
+            return Result.Err(Error("NotFound", id))
+        }
+        document: json = Json.fromValue({"id": id, "name": self.database[id]})?
+        text: str = Json.encode(document)?
+        # add: the first loader stores, later ones keep the stored value.
+        if self.client.add(self.key(id), text)? {
+            _ = self.client.incr(Prefix + "loads")?
+            _ = self.log(f"load:{id}")?
+        }
+        return self.client.get(self.key(id))
+    }
+
+    func get(self, id: str) -> Result[str] {
+        _ = self.client.incr(Prefix + "hits")?
+        cached: Result[str] = self.client.get(self.key(id))
+        if cached.ok() {
+            return cached
+        }
+        if cached.error.kind != "MemcachedNotFound" {
+            return cached
+        }
+        return self.load(id)
+    }
+
+    func name(self, id: str) -> Result[str] {
+        text: str = self.get(id)?
+        document: json = Json.decode(text)?
+        fields: dict[str, any] = Json.toDict(document)?
+        return Result.Ok(str(fields["name"]))
+    }
+
+    func invalidate(self, id: str) -> Result[bool] {
+        _ = self.log(f"invalidate:{id}")?
+        return self.client.delete(self.key(id))
+    }
+
+    func log(self, entry: str) -> Result[bool] {
+        # Appends are atomic on the server, so concurrent loaders never lose
+        # an entry (an append-or-add fallback would: two `add`s race).
+        if not self.client.append(Prefix + "log", "|" + entry)? {
+            return Result.Err(Error("LogMissing", "the log key was not created"))
+        }
+        return Result.Ok(true)
+    }
+}
+
+async func readName(cache: ProductCache, id: str) -> Result[str] {
+    return cache.name(id)
+}
+
+func run() -> Result[bool] {
+    client: Memcached = Memcached.connect("localhost:11211")?
+    for key in ["product:p-1", "product:p-2", "product:p-3", "loads", "hits", "log"] {
+        _ = client.delete(Prefix + key)?
+    }
+    database: dict[str, str] = {"p-1": "Grüße chair", "p-2": "Zoë's 🦅 lamp", "p-3": "東京 desk"}
+    cache: ProductCache = ProductCache(client, database)
+
+    # memcached starts a missing counter at its initial value (0) without
+    # adding `by`: create the counters first.
+    _ = client.set(Prefix + "loads", "0")?
+    _ = client.set(Prefix + "hits", "0")?
+    _ = client.set(Prefix + "log", "start")?
+    ids: list[str] = [f"p-{1 + i % 3}" for i in range(60)]
+    # Readers race on empty keys: only one `add` per product wins.
+    pending = [readName(cache, id) for id in ids]
+    names: list[str] = []
+    for task in pending {
+        r: Result[str] = await task
+        names.append(r.unwrapOr("error"))
+    }
+    print(f"concurrent first reads: {len(names)} results, {len(set(names))} distinct products")
+    print(f"every task saw its product: {[n for i, n in enumerate(names) if n != database[ids[i]]] == []}")
+    print(f"loads stored once per product: {client.get(Prefix + 'loads')?}")
+    print(f"hit counter: {client.get(Prefix + 'hits')?}")
+
+    before: int = int(client.get(Prefix + "loads")?)
+    again: list[str] = [cache.name(id)? for id in ids]
+    after: int = int(client.get(Prefix + "loads")?)
+    print(f"second pass hits the cache: {len([n for i, n in enumerate(again) if n == database[ids[i]]])} from cache" if before == after else "second pass reloaded")
+
+    database["p-2"] = "Zoë's 🦅 lamp v2"
+    _ = cache.invalidate("p-2")?
+    print(f"invalidation reloads: {cache.name('p-2')?}")
+
+    do {
+        _ = cache.name("p-404")?
+        print("missing product: found")
+    } catch err {
+        print(f"missing product: {err.kind} {err.message}")
+    }
+    entries: list[str] = client.get(Prefix + "log")?.split("|")
+    print(f"append log: {' '.join(sorted(entries))}")
+
+    for key in ["product:p-1", "product:p-2", "product:p-3", "loads", "hits", "log"] {
+        _ = client.delete(Prefix + key)?
+    }
+    print(f"cleanup: {not client.exists(Prefix + 'log')?}")
+    _ = client.close()?
+    return Result.Ok(true)
+}
+
+func main() {
+    r: Result[bool] = run()
+    if not r.ok() {
+        print(f"unexpected: {r.error}")
+        return
+    }
+    print("ok")
+}

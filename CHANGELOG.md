@@ -2,6 +2,37 @@
 
 All notable changes to `@lam/memcached` are documented here.
 
+## [2.0.4] - 2026-11-14
+
+### Fixed
+
+- `incr`/`decr` return a `MemcachedError` for a counter above the `int`
+  range. Memcached counters are unsigned 64-bit and the value was converted
+  with `int(value)`, so incrementing past 9223372036854775807 returned a
+  negative number.
+- `test-services.sh`: the `localhost:11212` fixture really requires SASL
+  PLAIN credentials. The official `memcached` image ignores
+  `MEMCACHED_USERNAME`/`MEMCACHED_PASSWORD`, so the "auth" fixture accepted
+  every client and the `_auth` tests never exercised authentication; it now
+  runs `memcached -S` with a SASL configuration and password file generated
+  in a temporary directory.
+
+### Tests
+
+- `tests/test_memcached_edge_cases.lam`: key limits in bytes (empty, 250/251
+  bytes, 125/126 `é`), spaces and non-ASCII keys; byte-exact values (every
+  byte value), empty and non-ASCII values, 1 MB stored and 2 MB refused;
+  counters on text, the zero floor and the int-range overflow; expiry,
+  `touch` and `add` after expiry; a refused port and every operation on a
+  closed client.
+- `tests/test_memcached_sasl_auth.lam`: correct, wrong and missing
+  credentials against the SASL fixture, shared data between authenticated
+  clients, 8 concurrent authenticated connections.
+- `tests/test_memcached_cache_composed.lam`: a cache-aside `ProductCache`
+  class (JSON values with non-ASCII text, `add` so concurrent loaders store
+  once, counters incremented from 60 async tasks, an append-only log,
+  invalidation, `?` and `do/catch`).
+
 ## [2.0.3] - 2026-11-03
 
 ### Changed

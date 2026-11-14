@@ -1,0 +1,118 @@
+# Edge cases against the unauthenticated fixture (localhost:11211).
+#
+#   * Keys: empty and over 250 bytes are MemcachedErrors; the limit is in
+#     bytes (125 "é" fit, 126 do not); spaces are fine in the binary
+#     protocol; non-ASCII keys round-trip.
+#   * Values: every byte value 0..255 round-trips byte-exact, as do empty and
+#     non-ASCII values; 1 000 000 bytes are stored, 2 000 000 are refused.
+#   * Counters: incr on text is an error, decr stops at 0, a counter above
+#     the int range is an error instead of a negative number (2.0.4 fix).
+#   * Expiry: a 1 s value expires, touch extends it, add after expiry works.
+#   * Connection failures and a closed client: every operation returns a
+#     MemcachedError.
+#
+# expect: keys: empty=MemcachedError 250=ok 251=MemcachedError 125é=ok 126é=MemcachedError space=ok unicode=ok
+# expect: values: bytes=true empty=true unicode=true 1MB=ok 2MB=MemcachedError
+# expect: counters: text=MemcachedError floor=0 then=3 max=9223372036854775807 overflow=MemcachedError
+# expect: overflow message: exceeds the int range
+# expect: expiry: expired=MemcachedNotFound touched=ok add-after-expiry=true
+# expect: refused port: MemcachedError
+# expect: closed client: 13/13 MemcachedError
+# expect: ok
+
+from @lam/memcached import Memcached
+from lamerrors import Result
+from lamtime import Time
+
+go! {
+    func mcAllBytes() string {
+        raw := make([]byte, 256)
+        for i := range raw {
+            raw[i] = byte(i)
+        }
+        return string(raw)
+    }
+}
+
+const Prefix: str = "lam:edge:memcached:"
+
+func kind(r: Result) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    return r.error.kind
+}
+
+func run() -> Result[bool] {
+    m: Memcached = Memcached.connect("localhost:11211")?
+
+    # ── Keys ────────────────────────────────────────────────────
+    k250: str = Prefix + "k" * (250 - len(Prefix))
+    keys: list[str] = [
+        f"empty={kind(m.set('', 'v'))}",
+        f"250={kind(m.set(k250, 'v'))}",
+        f"251={kind(m.set(k250 + 'k', 'v'))}",
+        f"125é={kind(m.set('é' * 125, 'v'))}",
+        f"126é={kind(m.set('é' * 126, 'v'))}",
+        f"space={kind(m.set(Prefix + 'a key with spaces', 'v'))}",
+    ]
+    _ = m.set(Prefix + "clé:🦅", "ünïcødé")?
+    keys.append(f"unicode={'ok' if m.get(Prefix + 'clé:🦅')? == 'ünïcødé' else 'mismatch'}")
+    print(f"keys: {' '.join(keys)}")
+
+    # ── Values ──────────────────────────────────────────────────
+    raw: str = ""
+    go! {
+        raw = mcAllBytes()
+    }
+    _ = m.set(Prefix + "bytes", raw)?
+    back: str = m.get(Prefix + "bytes")?
+    _ = m.set(Prefix + "empty", "")?
+    _ = m.set(Prefix + "text", "Grüße 🦅 東京")?
+    big: Result[bool] = m.set(Prefix + "big", "x" * 1000000)
+    huge: Result[bool] = m.set(Prefix + "huge", "x" * 2000000)
+    print(f"values: bytes={back == raw and len(bytes(back)) == 256} empty={m.get(Prefix + 'empty')? == ''} unicode={m.get(Prefix + 'text')? == 'Grüße 🦅 東京'} 1MB={kind(big)} 2MB={kind(huge)}")
+
+    # ── Counters ────────────────────────────────────────────────
+    _ = m.set(Prefix + "word", "abc")?
+    _ = m.set(Prefix + "n", "5")?
+    floor: int = m.decr(Prefix + "n", 10)?
+    then: int = m.incr(Prefix + "n", 3)?
+    _ = m.delete(Prefix + "u")?
+    top: int = m.incr(Prefix + "u", 9223372036854775807, 9223372036854775807)?
+    overflow: Result[int] = m.incr(Prefix + "u", 10)
+    print(f"counters: text={kind(m.incr(Prefix + 'word'))} floor={floor} then={then} max={top} overflow={kind(overflow)}")
+    print(f"overflow message: {'exceeds the int range' if overflow.error.message.contains('exceeds the int range') else overflow.error.message}")
+
+    # ── Expiry ──────────────────────────────────────────────────
+    _ = m.set(Prefix + "short", "v", 1)?
+    _ = m.set(Prefix + "touched", "v", 1)?
+    _ = m.touch(Prefix + "touched", 30)?
+    Time.sleepMs(2500)
+    expired: Result[str] = m.get(Prefix + "short")
+    touched: Result[str] = m.get(Prefix + "touched")
+    added: bool = m.add(Prefix + "short", "again")?
+    print(f"expiry: expired={kind(expired)} touched={kind(touched)} add-after-expiry={added}")
+
+    for key in [k250, Prefix + "a key with spaces", Prefix + "clé:🦅", Prefix + "bytes", Prefix + "empty", Prefix + "text", Prefix + "big", Prefix + "word", Prefix + "n", Prefix + "u", Prefix + "short", Prefix + "touched", "é" * 125] {
+        _ = m.delete(key)?
+    }
+
+    # ── Failures ────────────────────────────────────────────────
+    print(f"refused port: {kind(Memcached.connect('127.0.0.1:1'))}")
+    _ = m.close()?
+    _ = m.close()?
+    closed: list[Result] = [m.get("k"), m.set("k", "v"), m.add("k", "v"), m.replace("k", "v"), m.delete("k"), m.exists("k"), m.touch("k", 1), m.incr("k"), m.decr("k"), m.append("k", "v"), m.prepend("k", "v"), m.noop(), m.stats()]
+    kinds: set[str] = set([kind(r) for r in closed])
+    print(f"closed client: {len([r for r in closed if not r.ok()])}/{len(closed)} {','.join(sorted(kinds))}")
+    return Result.Ok(true)
+}
+
+func main() {
+    r: Result[bool] = run()
+    if not r.ok() {
+        print(f"unexpected: {r.error}")
+        return
+    }
+    print("ok")
+}

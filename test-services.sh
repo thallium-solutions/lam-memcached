@@ -6,6 +6,7 @@ set -eu
 ROOT=$(CDPATH= cd "$(dirname "$0")" && pwd)
 STARTED=""
 WAIT_PID=""
+SASL_DIR=""
 
 usage() {
     cat <<'EOF'
@@ -14,7 +15,8 @@ Usage:
 
 Starts the two Memcached fixtures used by the @lam/memcached integration tests:
   localhost:11211  unauthenticated fixture
-  localhost:11212  auth-path fixture (memuser / mempass123)
+  localhost:11212  SASL PLAIN fixture (memuser / mempass123); connections
+                   without these credentials are refused
 
 Containers started by this invocation are stopped when the script exits.
 Already-running services and containers are reused and are never stopped.
@@ -120,6 +122,10 @@ cleanup() {
             docker stop "$name" >/dev/null 2>&1 || true
         done
     fi
+    if [ -n "$SASL_DIR" ]; then
+        rm -rf "$SASL_DIR"
+        SASL_DIR=""
+    fi
     exit "$status"
 }
 
@@ -138,11 +144,22 @@ start_service memcached-test 11211 \
     -p 11211:11211 \
     memcached:latest
 
+# The official image ignores MEMCACHED_USERNAME/MEMCACHED_PASSWORD: SASL
+# needs -S, a SASL configuration (mech_list) and memcached's password file,
+# whose entries are user@realm (the realm is the container host name).
+SASL_DIR=$(mktemp -d "${TMPDIR:-/tmp}/lam-memcached-sasl.XXXXXX")
+printf 'mech_list: plain\n' > "$SASL_DIR/memcached.conf"
+printf 'memuser@lam-memcached-auth:mempass123\n' > "$SASL_DIR/memcached-sasl-pwdb"
+chmod 755 "$SASL_DIR"
+chmod 644 "$SASL_DIR/memcached.conf" "$SASL_DIR/memcached-sasl-pwdb"
+
 start_service memcached-test-auth 11212 \
     -p 11212:11211 \
-    -e MEMCACHED_USERNAME=memuser \
-    -e MEMCACHED_PASSWORD=mempass123 \
-    memcached:1.6
+    --hostname lam-memcached-auth \
+    -v "$SASL_DIR:/sasl:ro" \
+    -e SASL_CONF_PATH=/sasl \
+    -e MEMCACHED_SASL_PWDB=/sasl/memcached-sasl-pwdb \
+    memcached:1.6 memcached -S
 
 cat <<EOF
 

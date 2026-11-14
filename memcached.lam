@@ -10,6 +10,7 @@ go! {
     import (
         "errors"
         "fmt"
+        "math"
 
         mcgo "github.com/memcachier/mc/v3"
     )
@@ -30,6 +31,16 @@ go! {
         return LAMMERGEIER.Result.Err(LAMMERGEIER.Error(
             "MemcachedError", fmt.Sprintf("memcached: %s: %v", operation, err), nil,
         ))
+    }
+
+    // lamMcCounter returns a counter as a Lam int. Memcached counters are
+    // unsigned 64-bit: a value above the int range is an error instead of a
+    // negative number.
+    func lamMcCounter(operation string, key string, value uint64) *LAMMERGEIER.Result {
+        if value > math.MaxInt64 {
+            return lamMcFailure(operation+" "+key, fmt.Errorf("counter value %d exceeds the int range", value))
+        }
+        return LAMMERGEIER.Result.Ok(int(value))
     }
 
     func lamMcMissing(operation string, key string) *LAMMERGEIER.Result {
@@ -221,7 +232,7 @@ class Memcached {
             if err != nil {
                 return lamMcFailure("INCR "+key, err)
             }
-            return LAMMERGEIER.Result.Ok(int(value))
+            return lamMcCounter("INCR", key, value)
         }
     }
 
@@ -238,7 +249,7 @@ class Memcached {
             if err != nil {
                 return lamMcFailure("DECR "+key, err)
             }
-            return LAMMERGEIER.Result.Ok(int(value))
+            return lamMcCounter("DECR", key, value)
         }
     }
 

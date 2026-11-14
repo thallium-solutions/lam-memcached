@@ -1,0 +1,60 @@
+# SASL PLAIN against the authenticated fixture (localhost:11212,
+# memuser / mempass123). The fixture refuses unauthenticated clients, so
+# these checks prove the credentials are sent (test-services.sh 2.0.4: the
+# earlier fixture ignored its credentials and accepted every client).
+#
+# expect: correct credentials: ok
+# expect: wrong password: MemcachedError
+# expect: unknown user: MemcachedError
+# expect: no credentials: MemcachedError
+# expect: authenticated clients share data: true
+# expect: concurrent authenticated connects: 8/8
+# expect: ok
+
+from @lam/memcached import Memcached
+from lamerrors import Result
+
+const Addr: str = "localhost:11212"
+
+func kind(r: Result) -> str {
+    if r.ok() {
+        return "ok"
+    }
+    return r.error.kind
+}
+
+async func connectAndPing(i: int) -> Result[str] {
+    client: Memcached = Memcached.connect(Addr, username="memuser", password="mempass123")?
+    _ = client.set(f"lam:sasl:{i}", f"value-{i}")?
+    value: str = client.get(f"lam:sasl:{i}")?
+    _ = client.delete(f"lam:sasl:{i}")?
+    _ = client.close()?
+    return Result.Ok(value)
+}
+
+func main() {
+    good: Result[Memcached] = Memcached.connect(Addr, username="memuser", password="mempass123")
+    print(f"correct credentials: {kind(good)}")
+    print(f"wrong password: {kind(Memcached.connect(Addr, username = 'memuser', password = 'wrong'))}")
+    print(f"unknown user: {kind(Memcached.connect(Addr, username = 'nobody', password = 'mempass123'))}")
+    print(f"no credentials: {kind(Memcached.connect(Addr))}")
+
+    first: Memcached = good.unwrap()
+    second: Memcached = Memcached.connect(Addr, username="memuser", password="mempass123").unwrap()
+    _ = first.set("lam:sasl:shared", "shared")
+    print(f"authenticated clients share data: {second.get('lam:sasl:shared').unwrapOr('') == 'shared'}")
+    _ = second.delete("lam:sasl:shared")
+
+    pending = [connectAndPing(i) for i in range(8)]
+    values: list[str] = []
+    for task in pending {
+        r: Result[str] = await task
+        if r.ok() {
+            values.append(r.unwrap())
+        }
+    }
+    print(f"concurrent authenticated connects: {len([v for i, v in enumerate(values) if v == f'value-{i}'])}/8")
+    _ = first.close()
+    _ = second.close()
+    print("ok")
+}
